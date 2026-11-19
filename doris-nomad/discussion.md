@@ -1,3 +1,317 @@
+ref: [Nomad stateful service on local disk](https://claude.ai/share/48565109-0188-496b-9211-525156027441)
+
+# previous discussions
+(user) when using nomad to deploy and manage stateful servie with requirement using local disk. what's the best way to manage, plan with nomad-pack. please also consider rolling upgrade for distributed system with zero down time
+
+Short version: on Nomad 1.10 or later, use **dynamic host volumes with `sticky = true`** and run the cluster as **one task group with `count = N`**. Roll it with `max_parallel = 1` and a health check that only passes once a member has rejoined the cluster. nomad-pack should only template the job. Create the volumes separately, before the job, because they last longer than any one deploy.
+
+## 1. Choosing the storage type
+
+| Option | When to use it | Downsides |
+|---|---|---|
+| **Dynamic host volumes + sticky** (best choice, 1.10+) | Local NVMe or SSD, managed through the API or CLI | The data lives on one node, so that member is tied to that node |
+| Static host volumes (in the client config) | Older clusters | Adding a volume means editing the client config and restarting the agent; you have to pin members to nodes yourself |
+| CSI + `per_alloc` | Network storage (EBS, Ceph, SAN) | Not really local disk; slower and more moving parts |
+| `ephemeral_disk { sticky = true, migrate = true }` | Caches, data you can rebuild | Best effort only. Don't rely on it for a database |
+
+Since 1.10, host volumes no longer need to be defined as part of the Nomad client configuration, removing the need to restart the client agent as new volumes are added. Volumes are created by a plugin, so you can provision real storage. For example, they can now optionally be created with more detailed characteristics like their minimum and maximum capacities, capabilities, and custom provisioning parameters, and the plugin can drive LVM, ZFS or local NVMe.
+
+How sticky volumes behave: during the deployment the scheduler associates its ID with the task group that uses it. Stateful deployments require that any allocations belonging to that task group must be places or replaced on nodes that have this volume ID available. Also note that scaling jobs down does not delete unused volumes, nor does it touch the data present on them. That is safe, but you have to clean up old volumes yourself.
+
+## 2. Topology: one task group, not one group per member
+
+This is the most common mistake. **`update.max_parallel` applies per task group, and separate groups roll out in parallel.** Suppose you write `group "db-0"`, `group "db-1"` and `group "db-2"` in one job, each with `max_parallel = 1`. A destructive change then replaces all three members at once, and the cluster goes down.
+
+There are two correct patterns:
+
+- **A (recommended): one group with `count = N` and sticky volumes.** Each member's identity is `${NOMAD_ALLOC_INDEX}` (0..N-1). A replacement allocation keeps the same index, so it also keeps its volume. Members find each other through Consul or Nomad service discovery.
+- **B: one job per member** (for example `db-0`, `db-1`, `db-2`, each with `count = 1` and a fixed node). This gives you explicit per-member config and fixed placement. The cost is that your CI pipeline has to roll them one at a time: run the job, wait for its deployment to succeed, then move to the next.
+
+Pattern A sketch:
+
+```hcl
+job "[[ .my.job_name ]]" {
+  type = "service"
+
+  group "db" {
+    count = [[ .my.replicas ]]          # 3 or 5, an odd number for quorum
+
+    constraint { operator = "distinct_hosts"  value = "true" }
+    spread     { attribute = "${node.datacenter}" }   # or rack/AZ meta
+
+    volume "data" {
+      type            = "host"
+      source          = "[[ .my.volume_name ]]"
+      sticky          = true
+      access_mode     = "single-node-writer"
+      attachment_mode = "file-system"
+    }
+
+    # Don't replace a member just because its node briefly lost contact
+    disconnect {
+      lost_after = "10m"
+      replace    = false
+      reconcile  = "keep_original"
+    }
+    reschedule { attempts = 0  unlimited = false }   # let restarts handle it; avoid moving data around
+    restart    { attempts = 3  interval = "10m"  delay = "15s"  mode = "delay" }
+
+    update {
+      max_parallel      = 1
+      health_check      = "checks"
+      min_healthy_time  = "[[ .my.min_healthy_time ]]"   # e.g. 60s: time for it to catch up
+      healthy_deadline  = "15m"
+      progress_deadline = "30m"
+      auto_revert       = true
+      canary            = 0     # canaries need an extra volume and member; usually avoid for quorum systems
+      stagger           = "30s"
+    }
+
+    network { port "client" {}  port "peer" {} }
+
+    service {
+      name = "[[ .my.job_name ]]"
+      port = "client"
+      check {
+        type     = "http"
+        path     = "/health/ready"   # ready = joined the cluster AND caught up on replication
+        interval = "5s"
+        timeout  = "2s"
+      }
+    }
+
+    task "db" {
+      driver       = "docker"
+      kill_signal  = "SIGTERM"
+      kill_timeout = "120s"          # time to hand off leadership and flush
+      shutdown_delay = "10s"         # deregister from Consul before SIGTERM so clients drain
+
+      volume_mount { volume = "data"  destination = "/var/lib/db" }
+
+      env { NODE_ID = "[[ .my.job_name ]]-${NOMAD_ALLOC_INDEX}" }
+    }
+  }
+}
+```
+
+## 3. Laying out the nomad-pack
+
+```
+packs/mydb/
+  metadata.hcl
+  variables.hcl          # replicas, volume_name, image, update timings, node_pool
+  templates/
+    _helpers.tpl
+    mydb.nomad.tpl       # job only
+  volumes/
+    volume.hcl.tpl       # rendered separately, NOT submitted by `run`
+```
+
+Keep volume creation out of `nomad-pack run`. Volumes outlive deployments, and `nomad-pack destroy` must never take your data with it. Create one volume per node, as many as `replicas`, ahead of time. You can use `nomad volume create`, or render the volume template and loop over it in CI:
+
+```hcl
+name      = "mydb-data"
+type      = "host"
+plugin_id = "lvm-thin"           # or the built-in "mkdir" for a plain directory
+node_pool = "stateful"
+capacity_min = "200G"
+capability { access_mode = "single-node-writer"  attachment_mode = "file-system" }
+```
+
+Run this on each target node (you can pin with `node_id`), or manage the volumes with Terraform. Give the stateful nodes their own `node_pool` so other workloads can't use them.
+
+Workflow:
+
+```bash
+nomad-pack render ./packs/mydb -f prod.hcl        # look at the HCL
+nomad-pack plan   ./packs/mydb -f prod.hcl        # runs a `nomad job plan` under the hood
+nomad-pack run    ./packs/mydb -f prod.hcl
+nomad job deployment status -monitor <id>         # or poll in CI; fail if not "successful"
+```
+
+In CI, treat the plan output as a gate. A diff that shows **"create/destroy update"** is a destructive update and starts a rolling restart, so have it require approval. **"in-place update"** (for example changing only service tags or metadata) does not restart anything. If the plan ever shows allocations *placed on a new node* for this group, stop: the scheduler couldn't find the sticky volume.
+
+## 4. Zero-downtime rolling upgrades
+
+Nomad can only promise to replace one member at a time. Whether that means zero downtime depends on what the application does around it:
+
+1. **Quorum headroom.** Use N = 3 to tolerate 1 failure, or 5 to tolerate 2. With `max_parallel = 1` one member is down during each step, so never run 3 members when one of them is already unhealthy. Add a pre-flight step in CI that checks cluster health through the database's own API before `run`.
+2. **Health means caught up, not port open.** The `/ready` check should pass only after the member has rejoined, synced, and its replication lag is under a threshold. Combined with `min_healthy_time`, that is what keeps the next member from being stopped too early.
+3. **Graceful exit.** `shutdown_delay` deregisters the service so clients stop sending traffic. The app should then catch SIGTERM, transfer leadership if it holds it, and flush. Set `kill_timeout` longer than the worst-case handoff. Roll the leader last if you can; some teams add a step that transfers leadership before each deploy.
+4. **Clients must cope with one member being gone.** Give them multiple endpoints and retries (or a Consul DNS name), and make sure they tolerate a leader election. Without this, a single replaced member still causes errors.
+5. **Version compatibility.** A rolling upgrade means old and new versions run side by side. Check the database's upgrade path. Many systems require one minor version at a time and need a feature-flag or protocol bump after every member is upgraded. Do that in a separate deploy.
+6. **`auto_revert = true`** returns you to the last stable job version if a member fails its health check. Reverting only changes the image and config, not the data, so data-format migrations must be backward compatible or treated as one-way steps.
+
+## 5. Node maintenance (kernel and OS patching)
+
+Draining a node doesn't work well when the data lives on that node. The member can't move anywhere because its sticky volume is still there. For short maintenance windows:
+
+```bash
+nomad node eligibility -disable <node>
+# stop just this alloc (or let the reboot take it), patch, reboot
+nomad node eligibility -enable <node>      # the alloc comes back to the same volume
+```
+
+Do this for one node at a time and check cluster health between nodes. Because `disconnect.replace = false`, Nomad won't start a replacement member elsewhere while the node is down.
+
+To retire a node permanently, scale up to N+1 so a new member starts on a new node with a new volume. Wait for it to sync, remove the old member from the database cluster, then delete the old volume.
+
+Want me to put this on a Whiteboard?
+
+(user) my case is closed to the first option. tell me more but focus
+
+I've taken "first option" to mean the setup from my earlier answer: one task group with `count = N` and sticky dynamic host volumes. Below is how that setup behaves day to day, including where it breaks.
+
+## 1. How sticky claims work
+
+- When an allocation is first placed, the scheduler associates a volume ID with the task group. The group's allocations must be placed or replaced on nodes where that volume ID is available. Nomad stores these associations in its state store, along with job IDs, volume names, and namespaces.
+- So you create **one volume per node, all with the same `name`**, and the job refers to that name. Each allocation ends up holding a specific volume ID on a specific node.
+- From then on, each member is pinned to its node, and Nomad enforces that for you.
+
+**Provisioning rules:**
+
+```bash
+# one per stateful node, same name, plus 1 spare node/volume for recovery
+for node in $STATEFUL_NODES; do
+  nomad volume create -node "$node" volume.hcl     # name = "mydb-data"
+done
+```
+
+- Have **at least N+1 volumes** for `count = N`. The spare is what makes recovery from a dead node quick (section 4).
+- Put these nodes in a separate `node_pool` and have the job use `node_pool = "stateful"`. Then no other job can claim the volumes.
+- `distinct_hosts` is still worth keeping. It guards the first placement, before any claims exist.
+
+## 2. Member identity and joining the cluster
+
+`NOMAD_ALLOC_INDEX` keeps its value when an allocation is replaced, which works well as an identity. Even so, **make the data directory the real source of identity**:
+
+```bash
+# entrypoint.sh
+ID_FILE=/var/lib/db/member-id
+[ -f "$ID_FILE" ] || echo "mydb-${NOMAD_ALLOC_INDEX}" > "$ID_FILE"
+export MEMBER_ID=$(cat "$ID_FILE")
+```
+
+When a member is rebuilt onto a spare volume, it starts with an empty disk and a new ID file. The database then sees it as a new member, which is correct, instead of mistaking it for an old member that has lost its data.
+
+**Peer addressing.** The member is pinned to its node anyway, so give the peer port a static port number. Its peer address (node IP plus that port) then stays the same across restarts and upgrades:
+
+```hcl
+network {
+  port "peer"   { static = 7000 }
+  port "client" { static = 7001 }   # optional; dynamic is fine if clients use Consul
+}
+```
+
+**Bootstrap and discovery.** On the first deploy all N members start at once, so the database must keep retrying the join, or support something like `bootstrap_expect`. Render the peer list from service discovery:
+
+```hcl
+template {
+  destination = "local/peers.conf"
+  change_mode = "noop"          # don't restart members when peers change; the DB handles membership
+  data = <<EOT
+{{ range nomadService "mydb-peer" }}peer = "{{ .Address }}:{{ .Port }}"
+{{ end }}
+EOT
+}
+```
+
+Use `change_mode = "noop"`. Otherwise a rolling upgrade restarts **every** member each time one member re-registers, which wipes out the one-at-a-time rollout.
+
+## 3. How a rolling upgrade actually runs
+
+With sticky single-writer volumes, a destructive update replaces each member **on the same node**: the old allocation stops and releases its volume, then the new one starts and mounts it. Each member is therefore fully down for stop time + start time + catch-up time. Zero downtime only holds if the cluster can keep running with one member down. In practice:
+
+**Settings in the `update` block:**
+
+```hcl
+update {
+  max_parallel      = 1
+  canary            = 0        # see below
+  health_check      = "checks"
+  min_healthy_time  = "60s"    # longer than your worst catch-up/compaction blip
+  healthy_deadline  = "15m"    # long enough to replay WAL / sync after downtime
+  progress_deadline = "30m"
+  auto_revert       = true
+}
+```
+
+**No canaries.** A canary needs another volume to claim. With exactly N volumes it can't be placed. With a spare volume it would join as an extra member, which changes quorum math in a consensus system. Test the new version in staging, and treat `auto_revert` as the safety net.
+
+**Gate on readiness, not liveness.** Use a script check that asks the database itself:
+
+```hcl
+check {
+  name     = "member-ready"
+  type     = "script"
+  command  = "/usr/local/bin/ready.sh"   # exit 0 only if: joined, quorum seen, lag < threshold
+  interval = "5s"
+  timeout  = "3s"
+  on_update = "require_healthy"
+}
+```
+
+If the check only tests the port, Nomad marks the member healthy while it is still catching up. The next member then stops, and you can lose quorum.
+
+**Leader handoff.** Nomad doesn't let you choose the order allocations are replaced in, so handle the leader inside the app's shutdown:
+
+```hcl
+task "db" {
+  shutdown_delay = "10s"     # deregister service → clients move away first
+  kill_signal    = "SIGTERM" # handler: if leader → transfer leadership, then flush & exit
+  kill_timeout   = "120s"
+}
+```
+
+**Pre-flight in CI.** Before `nomad-pack run`, check that all N members are healthy and replication lag is near zero. If one member is already degraded, an N=3 cluster drops to 1 of 3 during the rollout.
+
+**Two different update paths:**
+- Changing the image, environment, resources or a template that triggers a restart is destructive and causes a rolling restart.
+- Changing service tags or check settings is usually in-place, with no restart.
+
+Your CI should read `nomad-pack plan` output and require approval for any **create/destroy update** on this group.
+
+## 4. Failure handling
+
+| Event | What Nomad does | What you do |
+|---|---|---|
+| Process crash | `restart` block restarts it on the same node and volume | Nothing |
+| Node reboot or short outage | With `disconnect { replace = false, reconcile = "keep_original" }`, it waits | Nothing; the member resyncs |
+| Node gone for good | If no node has the required volume ID, for example because the node is down or disconnected, Nomad creates a blocked evaluation. The allocation stays pending. | Manual recovery (below) |
+
+**Recovering from a dead node:**
+
+1. Remove the dead member from the database cluster (e.g. `member remove`) so quorum is calculated over N-1.
+2. Delete that task group's volume claim. You can list and delete task group host volume claims through the API. After a claim is deleted, Nomad assigns a different volume ID if the old one is unavailable and another feasible host volume with a matching name exists. This is why you keep a spare volume.
+3. The new allocation lands on the spare node with an empty disk and a new member ID (section 2). It joins and copies the data from its peers.
+4. Clean up the dead node's volume record, and provision a new spare.
+
+HashiCorp reserves claim deletion for emergencies and debugging; the docs advise using claim deletion only in operational emergencies or while debugging node problems. Write it up as a runbook step, not something that runs automatically.
+
+**Planned maintenance on a node** (one at a time): run `nomad node eligibility -disable`, then patch and reboot. The allocation returns to the same volume, and you re-enable the node. Avoid `node drain` here, because the member has nowhere to move.
+
+**Scaling down** removes members but does not delete unused volumes or the data on them. Remove the member from the database cluster *before* lowering `count`, and wipe the old volume before it is reused. Otherwise a later scale-up could claim it with stale data.
+
+## 5. What to make variables in the pack
+
+```hcl
+# variables.hcl
+variable "replicas"          { default = 3 }
+variable "volume_name"       { default = "mydb-data" }
+variable "node_pool"         { default = "stateful" }
+variable "image"             {}
+variable "min_healthy_time"  { default = "60s" }
+variable "healthy_deadline"  { default = "15m" }
+variable "kill_timeout"      { default = "120s" }
+variable "peer_port"         { default = 7000 }
+```
+
+Keep volume creation and the claim-recovery runbook **outside** the pack. Day-to-day changes go through `render → plan → run → monitor the deployment`. Volume lifecycle and claim deletion are separate operator tasks.
+
+If you tell me which database or system this is (etcd, Consul, Kafka/KRaft, CockroachDB, Postgres with Patroni…), I can fill in the actual readiness check, leader-handoff command and member-removal steps for it.
+
+
+
 # user input
 Update my enviroment. I deploy apache doris with 3 replica on 3 different server group in different DC which defined in nomad-pack. I want to let three replicas distirbute in 3 server groups. I can accpet rolling upgrade at most 1 server group down. sometimes, rolling upgrade should be at max parallel as 1 server across all groups.
 ## response
